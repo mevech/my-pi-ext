@@ -1,0 +1,17 @@
+{
+  "name": "linear-tui",
+  "version": "1.0.0",
+  "description": "Linear issues TUI overlay for pi",
+  "main": "index.ts",
+  "keywords": ["pi-extension", "linear"],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "dependencies": {
+    "@earendil-works/pi-tui": "*",
+    "@earendil-works/pi-ai": "*"
+  }
+}
