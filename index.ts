@@ -11,22 +11,28 @@
  *   /linear in-review    — filter by In Review state
  *   /linear done         — filter by Done state
  *   /linear all          — show all issues
+ *   /linear clear        — clear the active issue banner
+ *
+ * Selecting an issue shows its detail, then sets a persistent banner
+ * above the editor so you know which issue you're working on.
  *
  * In the overlay:
  *   ↑↓     navigate
  *   enter  show issue details
- *   /      cycle filter (All → Todo → In Progress → In Review → Done → Backlog)
+ *   /      fuzzy search (type to filter issues by title/identifier)
  *   r      refresh
  *   esc    close
  */
 
 import type { ExtensionAPI, ExtensionCommandContext, Theme } from "@earendil-works/pi-coding-agent";
-import type { Component, TUI } from "@earendil-works/pi-tui";
+import type { Component, Focusable, TUI } from "@earendil-works/pi-tui";
 import {
-  DynamicBorder,
+  fuzzyFilter,
+  Input,
   SelectList,
   type SelectItem,
   truncateToWidth,
+  visibleWidth,
 } from "@earendil-works/pi-tui";
 import { matchesKey } from "@earendil-works/pi-tui";
 
@@ -161,16 +167,19 @@ function priorityLabel(priority: number): string {
   }
 }
 
-const FILTER_CYCLE = [undefined, "Todo", "In Progress", "In Review", "Done", "Backlog"];
-
 // --- Issue List Overlay ---
 
-class IssueListOverlay implements Component {
+class IssueListOverlay implements Component, Focusable {
   private issues: LinearIssue[] = [];
+  private allItems: SelectItem[] = [];
   private selectList: SelectList = new SelectList([], 1, {});
   private error: string | null = null;
   private loading = true;
+  private searchMode = false;
+  private searchInput: Input;
+  private searchQuery = "";
   selectedIssueId: string | null = null;
+  focused = false;
 
   constructor(
     private tui: TUI,
@@ -178,6 +187,15 @@ class IssueListOverlay implements Component {
     private done: (result: string | null) => void,
     private currentFilter?: string
   ) {
+    this.searchInput = new Input();
+    this.searchInput.focused = false;
+    this.searchInput.onEscape = () => {
+      this.searchMode = false;
+      this.searchQuery = "";
+      this.searchInput.setValue("");
+      this.applyFuzzyFilter("");
+      this.tui.requestRender();
+    };
     this.loadIssues();
   }
 
@@ -197,7 +215,7 @@ class IssueListOverlay implements Component {
 
   private buildSelectList(): void {
     const th = this.theme;
-    const items: SelectItem[] = this.issues.map((issue) => {
+    this.allItems = this.issues.map((issue) => {
       const state = issue.state?.name ?? "Unknown";
       const project = issue.project?.name ?? "";
       const assignee = issue.assignee?.name ?? "";
@@ -209,7 +227,15 @@ class IssueListOverlay implements Component {
         description: desc ? `${state}  ${desc}` : state,
       };
     });
-    this.selectList = new SelectList(items, Math.min(items.length, 12), {
+    this.applyFuzzyFilter(this.searchQuery);
+  }
+
+  private applyFuzzyFilter(query: string): void {
+    const th = this.theme;
+    const filtered = fuzzyFilter(this.allItems, query, (item) =>
+      `${item.label} ${item.description ?? ""}`
+    );
+    this.selectList = new SelectList(filtered, Math.min(filtered.length, 12), {
       selectedPrefix: (t) => th.fg("accent", t),
       selectedText: (t) => th.fg("accent", t),
       description: (t) => th.fg("muted", t),
@@ -224,17 +250,32 @@ class IssueListOverlay implements Component {
   }
 
   handleInput(data: string): void {
+    if (this.searchMode) {
+      // In search mode, handle enter to exit search and keep results
+      if (matchesKey(data, "enter") || matchesKey(data, "escape")) {
+        this.searchMode = false;
+        this.searchInput.focused = false;
+        this.tui.requestRender();
+        return;
+      }
+      this.searchInput.handleInput(data);
+      this.searchQuery = this.searchInput.getValue();
+      this.applyFuzzyFilter(this.searchQuery);
+      this.tui.requestRender();
+      return;
+    }
+
     if (matchesKey(data, "r")) {
       this.loadIssues();
       return;
     }
     if (matchesKey(data, "/")) {
-      const currentIdx = this.currentFilter
-        ? FILTER_CYCLE.indexOf(this.currentFilter)
-        : 0;
-      const nextIdx = (currentIdx + 1) % FILTER_CYCLE.length;
-      this.currentFilter = FILTER_CYCLE[nextIdx];
-      this.loadIssues();
+      this.searchMode = true;
+      this.searchInput.focused = true;
+      this.searchInput.setValue("");
+      this.searchQuery = "";
+      this.applyFuzzyFilter("");
+      this.tui.requestRender();
       return;
     }
     this.selectList.handleInput(data);
@@ -297,15 +338,28 @@ class IssueListOverlay implements Component {
       lines.push(th.fg("border", "│") + " ".repeat(width - 2) + th.fg("border", "│"));
     }
 
-    // Footer hints
-    lines.push(
-      th.fg("border", "│") +
-        truncateToWidth(
-          th.fg("dim", " ↑↓ navigate • enter details • / filter • r refresh • esc close"),
-          width - 2
-        ) +
-        th.fg("border", "│")
-    );
+    // Search bar or footer hints
+    if (this.searchMode) {
+      const searchLabel = th.fg("accent", " Search: ");
+      const inputLines = this.searchInput.render(width - 2 - searchLabel.length);
+      for (const il of inputLines) {
+        lines.push(
+          th.fg("border", "│") +
+            searchLabel +
+            truncateToWidth(il, width - 2 - searchLabel.length) +
+            th.fg("border", "│")
+        );
+      }
+    } else {
+      lines.push(
+        th.fg("border", "│") +
+          truncateToWidth(
+            th.fg("dim", " ↑↓ navigate • enter details • / fuzzy search • r refresh • esc close"),
+            width - 2
+          ) +
+          th.fg("border", "│")
+      );
+    }
 
     // Bottom border
     lines.push(th.fg("accent", `╰${"─".repeat(width - 2)}╯`));
@@ -467,16 +521,90 @@ class IssueDetailOverlay implements Component {
 
 // --- Extension entry ---
 
+function formatIssueBanner(issue: LinearIssueDetail, theme: Theme): string[] {
+  const lines: string[] = [];
+  const stateName = issue.state?.name ?? "";
+  const stateColored = theme.fg(stateColor(stateName), `[${stateName}]`);
+  const identifier = theme.fg("accent", issue.identifier);
+  const title = issue.title;
+  const assignee = issue.assignee?.name;
+  const project = issue.project?.name;
+  const prio = issue.priority > 0 ? priorityLabel(issue.priority) : "";
+
+  // Build the content lines
+  const line1 = ` ${identifier} ${stateColored} ${title}`;
+  const metaParts: string[] = [];
+  if (project) metaParts.push(`📁 ${project}`);
+  if (assignee) metaParts.push(`👤 ${assignee}`);
+  if (prio) metaParts.push(prio);
+  if (issue.url) metaParts.push(theme.fg("accent", issue.url));
+  const line2 = metaParts.length > 0
+    ? theme.fg("dim", `   ${metaParts.join("  ·  ")}`)
+    : null;
+
+  // Measure the display width (strip ANSI to get real width)
+  const contentWidth = Math.max(
+    visibleWidth(line1),
+    line2 ? visibleWidth(line2) : 0
+  );
+  const innerWidth = contentWidth + 2; // 1 space padding each side
+  const borderLeft = theme.fg("borderAccent", "│ ");
+  const borderRight = theme.fg("borderAccent", " │");
+  const bg = (text: string) => theme.bg("customMessageBg", text);
+
+  // Top border
+  lines.push(bg(theme.fg("borderAccent", `╭${"─".repeat(innerWidth + 2)}╮`)));
+
+  // Line 1 with background
+  const pad1 = " ".repeat(innerWidth - visibleWidth(line1));
+  lines.push(bg(`${borderLeft}${line1}${pad1}${borderRight}`));
+
+  // Line 2 with background (if present)
+  if (line2) {
+    const pad2 = " ".repeat(innerWidth - visibleWidth(line2));
+    lines.push(bg(`${borderLeft}${line2}${pad2}${borderRight}`));
+  }
+
+  // Bottom border
+  lines.push(bg(theme.fg("borderAccent", `╰${"─".repeat(innerWidth + 2)}╯`)));
+
+  return lines;
+}
+
+function setActiveIssueBanner(
+  ctx: ExtensionCommandContext,
+  issue: LinearIssueDetail
+): void {
+  const bannerLines = formatIssueBanner(issue, ctx.ui.theme);
+  ctx.ui.setWidget("linear-active-issue", bannerLines);
+  ctx.ui.setStatus(
+    "linear-active-issue",
+    ctx.ui.theme.fg("accent", `⏺ ${issue.identifier}`)
+  );
+}
+
+function clearActiveIssueBanner(ctx: ExtensionCommandContext): void {
+  ctx.ui.setWidget("linear-active-issue", undefined);
+  ctx.ui.setStatus("linear-active-issue", undefined);
+}
+
 export default function linearTuiExtension(pi: ExtensionAPI) {
   pi.registerCommand("linear", {
     description: "Show Linear issues in TUI overlay",
     getArgumentCompletions: (prefix: string) => {
-      const states = ["all", "todo", "backlog", "in-progress", "in-review", "done"];
+      const states = ["all", "todo", "backlog", "in-progress", "in-review", "done", "clear"];
       const filtered = states.filter((s) => s.startsWith(prefix.toLowerCase()));
       return filtered.length > 0 ? filtered.map((s) => ({ value: s, label: s })) : null;
     },
     handler: async (args: string, ctx: ExtensionCommandContext) => {
       const filterArg = args?.trim().toLowerCase();
+
+      // Handle clear subcommand
+      if (filterArg === "clear") {
+        clearActiveIssueBanner(ctx);
+        ctx.ui.notify("Active issue banner cleared.", "info");
+        return;
+      }
 
       let filter: string | undefined;
       switch (filterArg) {
@@ -502,7 +630,7 @@ export default function linearTuiExtension(pi: ExtensionAPI) {
           break;
         default:
           ctx.ui.notify(
-            `Unknown filter: ${filterArg}. Try: todo, backlog, in-progress, in-review, done, all`,
+            `Unknown filter: ${filterArg}. Try: todo, backlog, in-progress, in-review, done, all, clear`,
             "warning"
           );
           return;
@@ -521,7 +649,7 @@ export default function linearTuiExtension(pi: ExtensionAPI) {
         }
       );
 
-      // If user selected an issue, show detail overlay
+      // If user selected an issue, show detail overlay then set the banner
       if (selectedId) {
         await ctx.ui.custom<void>(
           (tui, theme, _kb, done) => new IssueDetailOverlay(tui, theme, done, selectedId),
@@ -534,6 +662,21 @@ export default function linearTuiExtension(pi: ExtensionAPI) {
             },
           }
         );
+
+        // Fetch the issue and set the persistent banner
+        try {
+          const issue = await fetchIssueDetail(selectedId);
+          setActiveIssueBanner(ctx, issue);
+          ctx.ui.notify(
+            `Working on ${issue.identifier}: ${issue.title}`,
+            "info"
+          );
+        } catch (err: any) {
+          ctx.ui.notify(
+            `Selected issue ${selectedId} but failed to set banner: ${err.message}`,
+            "warning"
+          );
+        }
       }
     },
   });
